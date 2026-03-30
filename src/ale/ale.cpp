@@ -486,7 +486,35 @@ void runReconciliationInference(const AleArguments &args,
   Logger::info << std::endl;
   Logger::timed << "Reconciling gene trees with the species tree..."
                 << std::endl;
+  if (!args.dumpClvsDir.empty()) {
+    speciesTreeOptimizer.setDumpClvsDir(args.dumpClvsDir);
+  }
   speciesTreeOptimizer.reconcile(args.geneTreeSamples);
+}
+
+void runScenarioScoring(const AleArguments &args,
+                        AleOptimizer &speciesTreeOptimizer) {
+  bool hasXML = !args.scenarioXMLToScore.empty();
+  bool hasDir = !args.scenarioXMLDirToScore.empty();
+  if (!hasXML && !hasDir) {
+    return;
+  }
+  // If no sampling was done, CLVs may not be up to date.
+  if (!args.geneTreeSamples) {
+    speciesTreeOptimizer.getEvaluator().computeLikelihood();
+  }
+  if (hasXML) {
+    Logger::info << std::endl;
+    Logger::timed << "Scoring external RecPhyloXML scenario: "
+                  << args.scenarioXMLToScore << std::endl;
+    speciesTreeOptimizer.scoreScenarioXML(args.scenarioXMLToScore);
+  }
+  if (hasDir) {
+    Logger::info << std::endl;
+    Logger::timed << "Scoring all XML scenarios in directory: "
+                  << args.scenarioXMLDirToScore << std::endl;
+    speciesTreeOptimizer.scoreScenarioXMLDir(args.scenarioXMLDirToScore);
+  }
 }
 
 /**
@@ -574,6 +602,7 @@ void run(AleArguments &args) {
   // sampling reconciled gene trees
   if (speciesTreeOptimizer.getCurrentStep() <= AleStep::Reconciliation) {
     runReconciliationInference(args, speciesTreeOptimizer);
+    runScenarioScoring(args, speciesTreeOptimizer);
     speciesTreeOptimizer.setCurrentStep(AleStep::End);
     speciesTreeOptimizer.saveCheckpoint();
   }

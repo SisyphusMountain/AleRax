@@ -17,6 +17,7 @@ public:
 
   virtual void setAlpha(double alpha);
   virtual void setRates(const RatesVector &rates);
+  virtual void dumpCLVs(const std::string &, const std::string &) {}
 
 private:
   unsigned int _gammaCatNumber;
@@ -49,6 +50,11 @@ private:
   virtual bool computeProbability(CID cid, corax_rnode_t *speciesNode,
                                   unsigned int category, REAL &proba,
                                   ReconciliationCell<REAL> *recCell = nullptr);
+
+  virtual REAL computeEventProbaContribution(CID cid,
+                                             corax_rnode_t *speciesNode,
+                                             unsigned int category,
+                                             const ScoringNode &node);
 
   // functions to work with _llCache
   virtual size_t getHash() { return this->getSpeciesTreeHash(); }
@@ -315,6 +321,7 @@ bool UndatedDLMultiModel<REAL>::computeProbability(
       scale(temp);
       proba += temp;
       if (recCell && proba > maxProba) {
+        recCell->probaSelected = temp;
         recCell->event.type = ReconciliationEventType::EVENT_None;
         recCell->event.label = this->_ccp.getLeafLabel(cid);
         return true;
@@ -333,6 +340,7 @@ bool UndatedDLMultiModel<REAL>::computeProbability(
       scale(temp);
       proba += temp;
       if (recCell && proba > maxProba) {
+        recCell->probaSelected = temp;
         recCell->event.type = ReconciliationEventType::EVENT_S;
         recCell->event.leftGeneIndex = cidLeft;
         recCell->event.rightGeneIndex = cidRight;
@@ -344,6 +352,7 @@ bool UndatedDLMultiModel<REAL>::computeProbability(
       scale(temp);
       proba += temp;
       if (recCell && proba > maxProba) {
+        recCell->probaSelected = temp;
         recCell->event.type = ReconciliationEventType::EVENT_S;
         recCell->event.leftGeneIndex = cidRight;
         recCell->event.rightGeneIndex = cidLeft;
@@ -357,6 +366,7 @@ bool UndatedDLMultiModel<REAL>::computeProbability(
     scale(temp);
     proba += temp;
     if (recCell && proba > maxProba) {
+      recCell->probaSelected = temp;
       recCell->event.type = ReconciliationEventType::EVENT_D;
       recCell->event.leftGeneIndex = cidLeft;
       recCell->event.rightGeneIndex = cidRight;
@@ -373,6 +383,7 @@ bool UndatedDLMultiModel<REAL>::computeProbability(
     scale(temp);
     proba += temp;
     if (recCell && proba > maxProba) {
+      recCell->probaSelected = temp;
       recCell->event.type = ReconciliationEventType::EVENT_SL;
       recCell->event.lostSpeciesNode = g;
       recCell->event.pllDestSpeciesNode = this->getSpeciesLeft(speciesNode);
@@ -383,6 +394,7 @@ bool UndatedDLMultiModel<REAL>::computeProbability(
     scale(temp);
     proba += temp;
     if (recCell && proba > maxProba) {
+      recCell->probaSelected = temp;
       recCell->event.type = ReconciliationEventType::EVENT_SL;
       recCell->event.lostSpeciesNode = f;
       recCell->event.pllDestSpeciesNode = this->getSpeciesRight(speciesNode);
@@ -396,6 +408,7 @@ bool UndatedDLMultiModel<REAL>::computeProbability(
     scale(temp);
     proba = temp;
     if (recCell && proba > maxProba) {
+      recCell->probaSelected = temp * (_uE[ec] * _PD[ec] * 2.0);
       // in fact, nothing happens, we'll have to resample
       recCell->event.type = ReconciliationEventType::EVENT_DL;
       return true;
@@ -411,4 +424,80 @@ bool UndatedDLMultiModel<REAL>::computeProbability(
     return false;
   }
   return true;
+}
+
+/**
+ *  Probability contribution of the specific event described by 'node'
+ *  (used by scoreGivenScenario)
+ */
+template <class REAL>
+REAL UndatedDLMultiModel<REAL>::computeEventProbaContribution(
+    CID cid, corax_rnode_t *speciesNode, unsigned int category,
+    const ScoringNode &node) {
+  auto c = category;
+  auto e = speciesNode->node_index;
+  auto ec = e * _gammaCatNumber + c;
+  REAL t;
+  switch (node.event) {
+  case ReconciliationEventType::EVENT_None: {
+    // Leaf: probability is PS[ec] (speciation on terminal species branch)
+    t = REAL(_PS[ec]);
+    scale(t);
+    return t;
+  }
+  case ReconciliationEventType::EVENT_S: {
+    auto *speciesLeft = this->getSpeciesLeft(speciesNode);
+    auto *speciesRight = this->getSpeciesRight(speciesNode);
+    if (!speciesLeft || !speciesRight) { return REAL(); }
+    // Determine which direct species child of e contains node.leftSpeciesIdx.
+    // CLVs fold implicit SL events, so we must use the direct child index,
+    // not the gene child's (possibly deeper) species index from the XML.
+    auto *anc = this->getSpeciesTree().getNode(node.leftSpeciesIdx);
+    while (anc && anc->parent != speciesNode) { anc = anc->parent; }
+    auto fl = speciesLeft->node_index * _gammaCatNumber + c;
+    auto fr = speciesRight->node_index * _gammaCatNumber + c;
+    if (anc == speciesLeft) {
+      t = _dlclvs[node.leftCID][fl] * (_dlclvs[node.rightCID][fr] *
+                                        (_PS[ec] * node.freq));
+    } else {
+      t = _dlclvs[node.leftCID][fr] * (_dlclvs[node.rightCID][fl] *
+                                        (_PS[ec] * node.freq));
+    }
+    scale(t);
+    return t;
+  }
+  case ReconciliationEventType::EVENT_D: {
+    t = _dlclvs[node.leftCID][ec] *
+        (_dlclvs[node.rightCID][ec] * (_PD[ec] * node.freq));
+    scale(t);
+    return t;
+  }
+  case ReconciliationEventType::EVENT_SL: {
+    auto *speciesLeft = this->getSpeciesLeft(speciesNode);
+    auto *speciesRight = this->getSpeciesRight(speciesNode);
+    if (!speciesLeft || !speciesRight) { return REAL(); }
+    // Find direct species child of e that is ancestor of the lost species.
+    auto *anc = this->getSpeciesTree().getNode(node.lostSpeciesIdx);
+    while (anc && anc->parent != speciesNode) { anc = anc->parent; }
+    unsigned int sec, lec;
+    if (anc == speciesLeft) {
+      lec = speciesLeft->node_index * _gammaCatNumber + c;
+      sec = speciesRight->node_index * _gammaCatNumber + c;
+    } else {
+      lec = speciesRight->node_index * _gammaCatNumber + c;
+      sec = speciesLeft->node_index * _gammaCatNumber + c;
+    }
+    t = _dlclvs[cid][sec] * (_uE[lec] * _PS[ec]);
+    scale(t);
+    return t;
+  }
+  default:
+    Logger::error
+        << "UndatedDLMultiModel::computeEventProbaContribution: "
+           "unsupported event type "
+        << static_cast<int>(node.event) << " (DL/TL/T are not in DL model)"
+        << std::endl;
+    assert(false);
+    return REAL();
+  }
 }

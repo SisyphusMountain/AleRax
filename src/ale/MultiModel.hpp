@@ -1,8 +1,34 @@
 #pragma once
 
+#include <map>
+#include <numeric>
+#include <set>
+#include <unordered_map>
+
 #include <IO/HighwayCandidateParser.hpp>
+#include <IO/RecPhyloXMLParser.hpp>
 #include <ccp/ConditionalClades.hpp>
 #include <likelihoods/reconciliation_models/BaseReconciliationModel.hpp>
+
+/**
+ *  One node in a pre-parsed reconciliation scenario, ready for scoring.
+ *  Preorder traversal order; leaf nodes (EVENT_None) are included but
+ *  contribute ratio 1.0 to the log-probability sum.
+ */
+struct ScoringNode {
+  CID cid;
+  unsigned int speciesNodeIdx;           // corax node_index of species branch
+  ReconciliationEventType event;
+  CID leftCID = 0, rightCID = 0;        // for S/D/T
+  unsigned int leftSpeciesIdx = 0;       // for S: left child destination species
+  unsigned int rightSpeciesIdx = 0;      // for S: right child destination species
+  unsigned int destSpeciesIdx = 0;       // for T: transfer destination
+  unsigned int survivingSpeciesIdx = 0;  // for SL
+  unsigned int lostSpeciesIdx = 0;       // for SL
+  std::string leafLabel;                 // for EVENT_None
+  double freq = 1.0;                     // CCP split frequency
+};
+using ScoringScenario = std::vector<ScoringNode>;
 
 /**
  *  Temp storage for a clade event sampled in
@@ -11,6 +37,7 @@
 template <class REAL> struct ReconciliationCell {
   Scenario::Event event;
   REAL maxProba;
+  REAL probaSelected;
   double blLeft;
   double blRight;
 };
@@ -34,6 +61,10 @@ public:
   virtual ~MultiModelInterface() {}
 
   const ConditionalClades &getCCP() const { return _ccp; }
+  void setDumpClvsDir(const std::string &dir, const std::string &familyName = "family") {
+    _dumpClvsDir = dir;
+    _dumpClvsFamilyName = familyName;
+  }
 
   virtual void setAlpha(double alpha) = 0;
   virtual void setRates(const RatesVector &rates) = 0;
@@ -49,6 +80,35 @@ public:
   sampleReconciliations(unsigned int samples,
                         std::vector<std::shared_ptr<Scenario>> &scenarios) = 0;
 
+  /**
+   *  Build a ScoringScenario from a parsed RecPhyloXML gene tree.
+   *  speciesLabelToIdx maps every species node label (internal + leaf)
+   *  to its corax node_index.
+   */
+  /**
+   *  Returns false (and leaves 'out' empty) when the XML gene tree's leaf set
+   *  does not match this family's CCP — i.e. the XML is for a different family.
+   */
+  bool buildScoringScenario(
+      const XMLGeneNode &xmlRoot,
+      const std::unordered_map<std::string, unsigned int> &speciesLabelToIdx,
+      ScoringScenario &out) const;
+
+  /**
+   *  Compute log P(scenario | gene tree distribution, species tree, DTL params)
+   *  for rate category 'category'.  CLVs must already be up to date
+   *  (i.e. computeLogLikelihood() or sampleReconciliations() was called).
+   */
+  virtual double scoreGivenScenario(const ScoringScenario &nodes,
+                                    unsigned int category) = 0;
+
+  /**
+   *  Dump CLV data (Pi, E, event probabilities) to CSV files.
+   *  CLVs must already be up to date.
+   */
+  virtual void dumpCLVs(const std::string &dir,
+                        const std::string &familyName) = 0;
+
 protected:
   // should be called on changing the model rates (alpha/DTLO/
   // highways), as the LLs computed earlier become irrelevant
@@ -61,6 +121,8 @@ protected:
   const bool _memorySavings;
   ConditionalClades _ccp;
   std::unordered_map<size_t, double> _llCache;
+  std::string _dumpClvsDir;
+  std::string _dumpClvsFamilyName;
 };
 
 inline void MultiModelInterface::mapGenesToSpecies() {
@@ -153,6 +215,23 @@ protected:
                      ReconciliationCell<REAL> *recCell = nullptr) = 0;
 
   /**
+   *  Return the probability contribution of the *specific* event
+   *  described in 'node' (already looked up via buildScoringScenario).
+   *  Used by scoreGivenScenario.
+   */
+  virtual REAL computeEventProbaContribution(CID cid,
+                                             corax_rnode_t *speciesNode,
+                                             unsigned int category,
+                                             const ScoringNode &node) = 0;
+
+  /**
+   *  Compute log P(scenario | gene trees, species tree, DTL params)
+   *  for a given rate category.
+   */
+  virtual double scoreGivenScenario(const ScoringScenario &nodes,
+                                    unsigned int category) override;
+
+  /**
    *  Return a uniform random REAL from the [0,max) interval
    */
   REAL getRandom(REAL max) {
@@ -185,7 +264,8 @@ private:
    *  Jointly sample a category and a species branch based on
    *  the probability of the gene tree to be rooted in it
    */
-  corax_rnode_t *sampleOriginationSpecies(unsigned int &category);
+  corax_rnode_t *sampleOriginationSpecies(unsigned int &category,
+                                          REAL &totalLikelihood);
 
   /**
    *  Wrapper for the backtrace function
@@ -260,6 +340,10 @@ bool MultiModel<REAL>::sampleReconciliations(
   }
   // compute CLVs based on recomputed per-branch probas
   updateCLVs();
+  // optionally dump CLVs to disk for external use
+  if (!this->_dumpClvsDir.empty()) {
+    dumpCLVs(this->_dumpClvsDir, this->_dumpClvsFamilyName);
+  }
   // sample and save scenarios
   bool ok = true;
   for (unsigned int i = 0; i < samples; ++i) {
@@ -289,8 +373,9 @@ template <class REAL> void MultiModel<REAL>::updateCLVs() {
 
 template <class REAL>
 corax_rnode_t *
-MultiModel<REAL>::sampleOriginationSpecies(unsigned int &category) {
-  auto totalLikelihood = REAL();
+MultiModel<REAL>::sampleOriginationSpecies(unsigned int &category,
+                                           REAL &totalLikelihood) {
+  totalLikelihood = REAL();
   for (unsigned int c = 0; c < getGammaCatNumber(); ++c) {
     for (auto speciesNode : this->getPrunedSpeciesNodes()) {
       totalLikelihood += getRootCladeLikelihood(speciesNode, c);
@@ -317,13 +402,18 @@ bool MultiModel<REAL>::computeScenario(Scenario &scenario, bool stochastic) {
   auto rootCID = this->_ccp.getCladesNumber() - 1;
   // sample rate category and origination species
   unsigned int category = 0;
-  auto originationSpecies = sampleOriginationSpecies(category);
+  REAL totalLikelihood;
+  auto originationSpecies = sampleOriginationSpecies(category, totalLikelihood);
   // init scenario
   scenario.setSpeciesTree(&this->_speciesTree);
   auto geneRoot = scenario.generateGeneRoot();
   scenario.setGeneRoot(geneRoot);
   auto virtualRootIndex = 2 * this->_ccp.getLeafNumber();
   scenario.setVirtualRootIndex(virtualRootIndex);
+  // initialize log probability: log P(originate at (s,c))
+  scenario.initLogProba(
+      getLog(getRootCladeLikelihood(originationSpecies, category)) -
+      getLog(totalLikelihood));
   // run sampling recursion
   auto ok = backtrace(rootCID, originationSpecies, geneRoot, category, scenario,
                       stochastic);
@@ -341,6 +431,7 @@ bool MultiModel<REAL>::backtrace(CID cid, corax_rnode_t *speciesNode,
   if (!computeProbability(cid, speciesNode, c, proba)) {
     return false;
   }
+  REAL probaTotal = proba;
   // create a recCell, set its sampling probability and sample
   // an event of the clade on the species branch
   ReconciliationCell<REAL> recCell;
@@ -348,6 +439,7 @@ bool MultiModel<REAL>::backtrace(CID cid, corax_rnode_t *speciesNode,
   if (!computeProbability(cid, speciesNode, c, proba, &recCell)) {
     return false;
   }
+  scenario.addLogProba(getLog(recCell.probaSelected) - getLog(probaTotal));
   // fill the recCell's event fields:
   // - the current node index of the reconciled gene tree
   // - the current species node index
@@ -447,4 +539,246 @@ bool MultiModel<REAL>::backtrace(CID cid, corax_rnode_t *speciesNode,
     ok = false;
   }
   return ok;
+}
+
+// ---- buildScoringScenario implementation ----
+
+inline bool MultiModelInterface::buildScoringScenario(
+    const XMLGeneNode &xmlRoot,
+    const std::unordered_map<std::string, unsigned int> &speciesLabelToIdx,
+    ScoringScenario &out) const {
+  // Step 1: build leafNameToCID (reverse of getCidToLeaves)
+  std::unordered_map<std::string, CID> leafNameToCID;
+  for (const auto &kv : _ccp.getCidToLeaves()) {
+    leafNameToCID[kv.second] = kv.first;
+  }
+  // Step 2: build leaf set for each CID via memoized recursion
+  // (CIDs are NOT guaranteed to be in postorder, so linear iteration is wrong)
+  auto numClades = _ccp.getCladesNumber();
+  std::vector<std::set<std::string>> cidLeafSets(numClades);
+  std::vector<bool> cidLeafSetsBuilt(numClades, false);
+  std::function<void(CID)> buildLeafSet = [&](CID cid) {
+    if (cidLeafSetsBuilt[cid])
+      return;
+    cidLeafSetsBuilt[cid] = true;
+    if (_ccp.isLeaf(cid)) {
+      cidLeafSets[cid] = {_ccp.getLeafLabel(cid)};
+    } else {
+      const auto &splits = _ccp.getCladeSplits(cid);
+      if (!splits.empty()) {
+        buildLeafSet(splits[0].left);
+        buildLeafSet(splits[0].right);
+        cidLeafSets[cid] = cidLeafSets[splits[0].left];
+        for (const auto &lf : cidLeafSets[splits[0].right]) {
+          cidLeafSets[cid].insert(lf);
+        }
+      }
+    }
+  };
+  for (CID cid = 0; cid < numClades; ++cid) {
+    buildLeafSet(cid);
+  }
+  // Step 3: build leafSetToCID (serialised key → CID)
+  auto setToKey = [](const std::set<std::string> &s) {
+    std::string key;
+    for (const auto &l : s) {
+      if (!key.empty())
+        key += ',';
+      key += l;
+    }
+    return key;
+  };
+  std::unordered_map<std::string, CID> leafSetToCID;
+  for (CID cid = 0; cid < numClades; ++cid) {
+    leafSetToCID[setToKey(cidLeafSets[cid])] = cid;
+  }
+  // Helper: compute leaf set of an XMLGeneNode recursively
+  std::function<std::set<std::string>(const XMLGeneNode &)> xmlLeafSet =
+      [&](const XMLGeneNode &n) -> std::set<std::string> {
+    if (n.event == ReconciliationEventType::EVENT_None) {
+      return {n.name};
+    }
+    std::set<std::string> s;
+    for (const auto &child : n.children) {
+      for (const auto &lf : xmlLeafSet(child)) {
+        s.insert(lf);
+      }
+    }
+    return s;
+  };
+  // Step 3b: check that the XML root's leaf set matches this family's CCP.
+  // If not, the XML is for a different family — return false silently.
+  {
+    auto rootKey = setToKey(xmlLeafSet(xmlRoot));
+    if (leafSetToCID.find(rootKey) == leafSetToCID.end()) {
+      return false;
+    }
+  }
+  // Flag set to false on any lookup error; checked at end to return false.
+  bool valid = true;
+  // Helper: look up CID from an XMLGeneNode's leaf set
+  auto getCID = [&](const XMLGeneNode &n) -> CID {
+    auto key = setToKey(xmlLeafSet(n));
+    auto it = leafSetToCID.find(key);
+    if (it == leafSetToCID.end()) {
+      Logger::info << "buildScoringScenario: leaf set not found in CCP: "
+                   << key << " (skipping XML)" << std::endl;
+      valid = false;
+      return 0;
+    }
+    return it->second;
+  };
+  // Helper: look up species node index from a label
+  auto getSpIdx = [&](const std::string &label) -> unsigned int {
+    if (label.empty()) {
+      Logger::info << "buildScoringScenario: empty species label"
+                   << " (skipping XML)" << std::endl;
+      valid = false;
+      return 0;
+    }
+    auto it = speciesLabelToIdx.find(label);
+    if (it == speciesLabelToIdx.end()) {
+      Logger::info << "buildScoringScenario: species label not found: "
+                   << label << " (skipping XML)" << std::endl;
+      valid = false;
+      return 0;
+    }
+    return it->second;
+  };
+  // Helper: find split frequency for (leftCID, rightCID) pair
+  auto getSplitFreq = [&](CID parentCID, CID leftCID,
+                          CID rightCID) -> double {
+    for (const auto &split : _ccp.getCladeSplits(parentCID)) {
+      if ((split.left == leftCID && split.right == rightCID) ||
+          (split.left == rightCID && split.right == leftCID)) {
+        return split.frequency;
+      }
+    }
+    Logger::info << "buildScoringScenario: CCP split not found for cid="
+                 << parentCID << " leftCID=" << leftCID
+                 << " rightCID=" << rightCID << " (skipping XML)" << std::endl;
+    valid = false;
+    return 1.0;
+  };
+
+  // Step 4: recursive preorder walk
+  std::function<void(const XMLGeneNode &)> walk =
+      [&](const XMLGeneNode &xmlNode) {
+        ScoringNode sn;
+        sn.cid = getCID(xmlNode);
+        sn.speciesNodeIdx = getSpIdx(xmlNode.speciesLabel);
+        sn.event = xmlNode.event;
+        switch (xmlNode.event) {
+        case ReconciliationEventType::EVENT_None:
+          sn.leafLabel = xmlNode.name;
+          out.push_back(sn);
+          return;
+        case ReconciliationEventType::EVENT_S: {
+          assert(xmlNode.children.size() == 2);
+          sn.leftCID = getCID(xmlNode.children[0]);
+          sn.rightCID = getCID(xmlNode.children[1]);
+          sn.leftSpeciesIdx = getSpIdx(xmlNode.children[0].speciesLabel);
+          sn.rightSpeciesIdx = getSpIdx(xmlNode.children[1].speciesLabel);
+          sn.freq = getSplitFreq(sn.cid, sn.leftCID, sn.rightCID);
+          out.push_back(sn);
+          walk(xmlNode.children[0]);
+          walk(xmlNode.children[1]);
+          return;
+        }
+        case ReconciliationEventType::EVENT_D: {
+          assert(xmlNode.children.size() == 2);
+          sn.leftCID = getCID(xmlNode.children[0]);
+          sn.rightCID = getCID(xmlNode.children[1]);
+          sn.freq = getSplitFreq(sn.cid, sn.leftCID, sn.rightCID);
+          out.push_back(sn);
+          walk(xmlNode.children[0]);
+          walk(xmlNode.children[1]);
+          return;
+        }
+        case ReconciliationEventType::EVENT_T: {
+          // children[0] stays at source, children[1] is transferred
+          assert(xmlNode.children.size() == 2);
+          sn.leftCID = getCID(xmlNode.children[0]);
+          sn.rightCID = getCID(xmlNode.children[1]);
+          sn.destSpeciesIdx = getSpIdx(xmlNode.destSpeciesLabel);
+          sn.freq = getSplitFreq(sn.cid, sn.leftCID, sn.rightCID);
+          out.push_back(sn);
+          walk(xmlNode.children[0]);
+          walk(xmlNode.children[1]);
+          return;
+        }
+        case ReconciliationEventType::EVENT_SL: {
+          // 1 child: the surviving subtree
+          assert(xmlNode.children.size() == 1);
+          sn.survivingSpeciesIdx = getSpIdx(xmlNode.children[0].speciesLabel);
+          sn.lostSpeciesIdx = getSpIdx(xmlNode.lostSpeciesLabel);
+          out.push_back(sn);
+          walk(xmlNode.children[0]);
+          return;
+        }
+        case ReconciliationEventType::EVENT_TL: {
+          Logger::info << "buildScoringScenario: EVENT_TL encountered; "
+                          "not yet supported for scoring (skipping XML)"
+                       << std::endl;
+          valid = false;
+          return;
+        }
+        default:
+          Logger::info << "buildScoringScenario: unexpected event type "
+                       << static_cast<int>(xmlNode.event)
+                       << " (skipping XML)" << std::endl;
+          valid = false;
+        }
+      };
+  walk(xmlRoot);
+  return valid;
+}
+
+// ---- scoreGivenScenario implementation ----
+
+template <class REAL>
+double MultiModel<REAL>::scoreGivenScenario(const ScoringScenario &nodes,
+                                            unsigned int category) {
+  if (nodes.empty()) {
+    return 0.0;
+  }
+  auto c = category;
+  // Step 1: total likelihood — sum over ALL gamma categories and all pruned
+  // species nodes, matching the denominator used in sampleOriginationSpecies.
+  REAL totalLikelihood = REAL();
+  for (unsigned int ci = 0; ci < getGammaCatNumber(); ++ci) {
+    for (auto speciesNode : this->getPrunedSpeciesNodes()) {
+      totalLikelihood += getRootCladeLikelihood(speciesNode, ci);
+    }
+  }
+  // Step 2: root node contribution
+  // Matches backtrace: initLogProba(log(rootClvLikelihood) - log(total))
+  //                  + addLogProba(log(probaSelected) - log(probaTotal))
+  // where rootClvLikelihood = OP * CLV(rootCID, s_root)
+  //       probaTotal         = CLV(rootCID, s_root)  [from computeProbability]
+  const auto &rootNode = nodes[0];
+  corax_rnode_t *rootSpeciesNode =
+      this->getSpeciesTree().getNode(rootNode.speciesNodeIdx);
+  REAL rootClvLikelihood = getRootCladeLikelihood(rootSpeciesNode, c);
+  REAL rootProbaTotal;
+  computeProbability(rootNode.cid, rootSpeciesNode, c, rootProbaTotal);
+  REAL rootProbaSelected =
+      computeEventProbaContribution(rootNode.cid, rootSpeciesNode, c, rootNode);
+  double logP = getLog(rootClvLikelihood) - getLog(totalLikelihood) +
+                getLog(rootProbaSelected) - getLog(rootProbaTotal);
+  // Step 3: remaining nodes (including leaves — leaf events contribute
+  // log(PS[ec]) - log(uq[ec]) < 0 due to DL/TL loop-back terms in uq)
+  for (size_t i = 1; i < nodes.size(); ++i) {
+    const auto &sn = nodes[i];
+    corax_rnode_t *spNode = this->getSpeciesTree().getNode(sn.speciesNodeIdx);
+    REAL probaTotal = REAL();
+    if (!computeProbability(sn.cid, spNode, c, probaTotal)) {
+      Logger::error << "scoreGivenScenario: computeProbability failed"
+                    << std::endl;
+      assert(false);
+    }
+    REAL probaSelected = computeEventProbaContribution(sn.cid, spNode, c, sn);
+    logP += getLog(probaSelected) - getLog(probaTotal);
+  }
+  return logP;
 }

@@ -1,6 +1,12 @@
 #pragma once
 
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+
 #include <trees/DatedTree.hpp>
+#include <IO/Logger.hpp>
+#include <IO/FileSystem.hpp>
 
 #include "MultiModel.hpp"
 
@@ -28,6 +34,7 @@ public:
   virtual void setAlpha(double alpha);
   virtual void setRates(const RatesVector &rates);
   virtual void setHighways(const std::vector<Highway> &highways);
+  virtual void dumpCLVs(const std::string &dir, const std::string &familyName);
 
 private:
   DatedTree &_datedTree;
@@ -80,6 +87,11 @@ private:
   virtual bool computeProbability(CID cid, corax_rnode_t *speciesNode,
                                   unsigned int category, REAL &proba,
                                   ReconciliationCell<REAL> *recCell = nullptr);
+
+  virtual REAL computeEventProbaContribution(CID cid,
+                                             corax_rnode_t *speciesNode,
+                                             unsigned int category,
+                                             const ScoringNode &node);
 
   // functions to deal with transfers
   void updateTransferCandidates();
@@ -544,6 +556,7 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
       scale(temp);
       proba += temp;
       if (recCell && proba > maxProba) {
+        recCell->probaSelected = temp;
         recCell->event.type = ReconciliationEventType::EVENT_None;
         recCell->event.label = this->_ccp.getLeafLabel(cid);
         return true;
@@ -563,6 +576,7 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
       scale(temp);
       proba += temp;
       if (recCell && proba > maxProba) {
+        recCell->probaSelected = temp;
         recCell->event.type = ReconciliationEventType::EVENT_S;
         recCell->event.leftGeneIndex = cidLeft;
         recCell->event.rightGeneIndex = cidRight;
@@ -575,6 +589,7 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
       scale(temp);
       proba += temp;
       if (recCell && proba > maxProba) {
+        recCell->probaSelected = temp;
         recCell->event.type = ReconciliationEventType::EVENT_S;
         recCell->event.leftGeneIndex = cidRight;
         recCell->event.rightGeneIndex = cidLeft;
@@ -589,6 +604,7 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
     scale(temp);
     proba += temp;
     if (recCell && proba > maxProba) {
+      recCell->probaSelected = temp;
       recCell->event.type = ReconciliationEventType::EVENT_D;
       recCell->event.leftGeneIndex = cidLeft;
       recCell->event.rightGeneIndex = cidRight;
@@ -596,7 +612,7 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
       recCell->blRight = cladeSplit.blRight;
       return true;
     }
-    // - T event
+    // - T event (cidLeft stays at e, cidRight transfers to dest d)
     temp = _dtlclvs[cidLeft]._uq[ec] *
            (_dtlclvs[cidRight]._tq[ec] * (_PT[ec] * freq));
     scale(temp);
@@ -606,12 +622,20 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
       if (!sampleTransferEvent(cidRight, speciesNode, c, recCell->event)) {
         return false;
       }
+      // Fix: set probaSelected to the specific-destination probability
+      auto d  = recCell->event.destSpeciesNode;
+      auto dc = d * _gammaCatNumber + c;
+      recCell->probaSelected = _dtlclvs[cidLeft]._uq[ec] *
+          (_dtlclvs[cidRight]._uq[dc] *
+           (_PT[ec] * freq / getTransferWeightNorm(e)));
+      scale(recCell->probaSelected);
       recCell->event.leftGeneIndex = cidLeft;
       recCell->event.rightGeneIndex = cidRight;
       recCell->blLeft = cladeSplit.blLeft;
       recCell->blRight = cladeSplit.blRight;
       return true;
     }
+    // - T event (cidRight stays at e, cidLeft transfers to dest d)
     temp = _dtlclvs[cidRight]._uq[ec] *
            (_dtlclvs[cidLeft]._tq[ec] * (_PT[ec] * freq));
     scale(temp);
@@ -621,6 +645,13 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
       if (!sampleTransferEvent(cidLeft, speciesNode, c, recCell->event)) {
         return false;
       }
+      // Fix: set probaSelected to the specific-destination probability
+      auto d  = recCell->event.destSpeciesNode;
+      auto dc = d * _gammaCatNumber + c;
+      recCell->probaSelected = _dtlclvs[cidRight]._uq[ec] *
+          (_dtlclvs[cidLeft]._uq[dc] *
+           (_PT[ec] * freq / getTransferWeightNorm(e)));
+      scale(recCell->probaSelected);
       recCell->event.leftGeneIndex = cidRight;
       recCell->event.rightGeneIndex = cidLeft;
       recCell->blLeft = cladeSplit.blRight;
@@ -641,6 +672,7 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
                   << " " << freq << std::endl;
       }
       if (recCell && proba > maxProba) {
+        recCell->probaSelected = temp;
         recCell->event.type = ReconciliationEventType::EVENT_T;
         recCell->event.destSpeciesNode = d;
         recCell->event.pllDestSpeciesNode = highway.highway.dest;
@@ -660,6 +692,7 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
                   << freq << std::endl;
       }
       if (recCell && proba > maxProba) {
+        recCell->probaSelected = temp;
         recCell->event.type = ReconciliationEventType::EVENT_T;
         recCell->event.destSpeciesNode = d;
         recCell->event.pllDestSpeciesNode = highway.highway.dest;
@@ -679,6 +712,7 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
     scale(temp);
     proba += temp;
     if (recCell && proba > maxProba) {
+      recCell->probaSelected = temp;
       recCell->event.type = ReconciliationEventType::EVENT_SL;
       recCell->event.lostSpeciesNode = g;
       recCell->event.pllDestSpeciesNode = this->getSpeciesLeft(speciesNode);
@@ -689,6 +723,7 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
     scale(temp);
     proba += temp;
     if (recCell && proba > maxProba) {
+      recCell->probaSelected = temp;
       recCell->event.type = ReconciliationEventType::EVENT_SL;
       recCell->event.lostSpeciesNode = f;
       recCell->event.pllDestSpeciesNode = this->getSpeciesRight(speciesNode);
@@ -703,6 +738,7 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
       scale(temp);
       proba = temp;
       if (recCell && proba > maxProba) {
+        recCell->probaSelected = temp * (_uE[ec] * _PD[ec] * 2.0);
         // in fact, nothing happens, we'll have to resample
         recCell->event.type = ReconciliationEventType::EVENT_DL;
         return true;
@@ -715,6 +751,7 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
       scale(temp);
       proba += temp;
       if (recCell && proba > maxProba) {
+        recCell->probaSelected = temp;
         // in fact, nothing happens, we'll have to resample
         recCell->event.type = ReconciliationEventType::EVENT_DL;
         return true;
@@ -726,6 +763,7 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
     scale(temp);
     proba += temp;
     if (recCell && proba > maxProba) {
+      recCell->probaSelected = temp;
       // in fact, nothing happens, we'll have to resample
       recCell->event.type = ReconciliationEventType::EVENT_TL;
       recCell->event.pllDestSpeciesNode = nullptr;
@@ -740,6 +778,12 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
       if (!sampleTransferEvent(cid, speciesNode, c, recCell->event)) {
         return false;
       }
+      // Fix: set probaSelected to the specific-destination probability
+      auto d  = recCell->event.destSpeciesNode;
+      auto dc = d * _gammaCatNumber + c;
+      recCell->probaSelected = _dtlclvs[cid]._uq[dc] *
+          (_uE[ec] * _PT[ec] / getTransferWeightNorm(e));
+      scale(recCell->probaSelected);
       return true;
     }
     // - highway TL event
@@ -751,6 +795,7 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
       scale(temp);
       proba += temp;
       if (recCell && proba > maxProba) {
+        recCell->probaSelected = temp;
         // in fact, nothing happens, we'll have to resample
         recCell->event.type = ReconciliationEventType::EVENT_TL;
         recCell->event.pllDestSpeciesNode = nullptr;
@@ -761,6 +806,7 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
       scale(temp);
       proba += temp;
       if (recCell && proba > maxProba) {
+        recCell->probaSelected = temp;
         recCell->event.type = ReconciliationEventType::EVENT_TL;
         recCell->event.destSpeciesNode = d;
         recCell->event.pllDestSpeciesNode = highway.highway.dest;
@@ -778,4 +824,216 @@ bool UndatedDTLMultiModel<REAL>::computeProbability(
     return false;
   }
   return true;
+}
+
+/**
+ *  Probability contribution of the specific event described by 'node'
+ *  (used by scoreGivenScenario)
+ */
+template <class REAL>
+REAL UndatedDTLMultiModel<REAL>::computeEventProbaContribution(
+    CID cid, corax_rnode_t *speciesNode, unsigned int category,
+    const ScoringNode &node) {
+  auto c = category;
+  auto e = speciesNode->node_index;
+  auto ec = e * _gammaCatNumber + c;
+  REAL t;
+  switch (node.event) {
+  case ReconciliationEventType::EVENT_None: {
+    t = REAL(_PS[ec]);
+    scale(t);
+    return t;
+  }
+  case ReconciliationEventType::EVENT_S: {
+    auto *speciesLeft = this->getSpeciesLeft(speciesNode);
+    auto *speciesRight = this->getSpeciesRight(speciesNode);
+    if (!speciesLeft || !speciesRight) { return REAL(); }
+    // Determine which direct species child of e contains node.leftSpeciesIdx.
+    // CLVs fold implicit SL events, so we must use the direct child index,
+    // not the gene child's (possibly deeper) species index from the XML.
+    auto *anc = this->getSpeciesTree().getNode(node.leftSpeciesIdx);
+    while (anc && anc->parent != speciesNode) { anc = anc->parent; }
+    auto fl = speciesLeft->node_index * _gammaCatNumber + c;
+    auto fr = speciesRight->node_index * _gammaCatNumber + c;
+    if (anc == speciesLeft) {
+      t = _dtlclvs[node.leftCID]._uq[fl] *
+          (_dtlclvs[node.rightCID]._uq[fr] * (_PS[ec] * node.freq));
+    } else {
+      t = _dtlclvs[node.leftCID]._uq[fr] *
+          (_dtlclvs[node.rightCID]._uq[fl] * (_PS[ec] * node.freq));
+    }
+    scale(t);
+    return t;
+  }
+  case ReconciliationEventType::EVENT_D: {
+    t = _dtlclvs[node.leftCID]._uq[ec] *
+        (_dtlclvs[node.rightCID]._uq[ec] * (_PD[ec] * node.freq));
+    scale(t);
+    return t;
+  }
+  case ReconciliationEventType::EVENT_T: {
+    // leftCID stays at e, rightCID is at destSpeciesIdx
+    auto dec = node.destSpeciesIdx * _gammaCatNumber + c;
+    double N = getTransferWeightNorm(e);
+    t = _dtlclvs[node.leftCID]._uq[ec] *
+        (_dtlclvs[node.rightCID]._uq[dec] * (_PT[ec] * node.freq / N));
+    scale(t);
+    return t;
+  }
+  case ReconciliationEventType::EVENT_SL: {
+    auto *speciesLeft = this->getSpeciesLeft(speciesNode);
+    auto *speciesRight = this->getSpeciesRight(speciesNode);
+    if (!speciesLeft || !speciesRight) { return REAL(); }
+    // Find direct species child of e that is ancestor of the lost species.
+    auto *anc = this->getSpeciesTree().getNode(node.lostSpeciesIdx);
+    while (anc && anc->parent != speciesNode) { anc = anc->parent; }
+    unsigned int sec, lec;
+    if (anc == speciesLeft) {
+      lec = speciesLeft->node_index * _gammaCatNumber + c;
+      sec = speciesRight->node_index * _gammaCatNumber + c;
+    } else {
+      lec = speciesRight->node_index * _gammaCatNumber + c;
+      sec = speciesLeft->node_index * _gammaCatNumber + c;
+    }
+    t = _dtlclvs[cid]._uq[sec] * (_uE[lec] * _PS[ec]);
+    scale(t);
+    return t;
+  }
+  default:
+    Logger::error
+        << "UndatedDTLMultiModel::computeEventProbaContribution: "
+           "unsupported event type "
+        << static_cast<int>(node.event)
+        << " (DL/TL explicit nodes not supported for scoring)" << std::endl;
+    assert(false);
+    return REAL();
+  }
+}
+
+// ============================================================================
+// CLV dump implementation
+// ============================================================================
+
+template <class REAL>
+void UndatedDTLMultiModel<REAL>::dumpCLVs(const std::string &dir,
+                                           const std::string &familyName) {
+  FileSystem::mkdir(dir, true);
+
+  const auto &speciesNodes = this->getAllSpeciesNodes();
+  unsigned int nSpecies = speciesNodes.size();
+  unsigned int nClades = this->_ccp.getCladesNumber();
+  unsigned int cat = 0; // gamma category 0 (single-category mode)
+
+  // --- File 1: branch_params.csv ---
+  {
+    std::string path = dir + "/" + familyName + "_branch_params.csv";
+    std::ofstream os(path);
+    os << "species_label,node_index,PS,PD,PT,PL,log_uE,log_tE,OP" << std::endl;
+    os << std::setprecision(15);
+    for (unsigned int i = 0; i < nSpecies; ++i) {
+      auto *node = speciesNodes[i];
+      auto e = node->node_index;
+      auto ec = e * _gammaCatNumber + cat;
+      os << node->label << ","
+         << e << ","
+         << _PS[ec] << ","
+         << _PD[ec] << ","
+         << _PT[ec] << ","
+         << _PL[ec] << ","
+         << getLog<REAL>(_uE[ec]) << ","
+         << getLog<REAL>(_tE[ec]) << ","
+         << _OP[e] << std::endl;
+    }
+    os.close();
+    Logger::info << "  Dumped branch params to " << path << std::endl;
+  }
+
+  // --- File 2: clv.csv ---
+  {
+    std::string path = dir + "/" + familyName + "_clv.csv";
+    std::ofstream os(path);
+    os << "cid,species_label,node_index,log_uq,log_tq" << std::endl;
+    os << std::setprecision(15);
+    for (CID cid = 0; cid < nClades; ++cid) {
+      for (unsigned int i = 0; i < nSpecies; ++i) {
+        auto *node = speciesNodes[i];
+        auto e = node->node_index;
+        auto ec = e * _gammaCatNumber + cat;
+        double logUq = getLog<REAL>(_dtlclvs[cid]._uq[ec]);
+        double logTq = getLog<REAL>(_dtlclvs[cid]._tq[ec]);
+        os << cid << ","
+           << node->label << ","
+           << e << ","
+           << logUq << ","
+           << logTq << std::endl;
+      }
+    }
+    os.close();
+    Logger::info << "  Dumped CLVs (" << nClades << " clades x "
+                 << nSpecies << " species) to " << path << std::endl;
+  }
+
+  // --- File 3: clades.csv ---
+  {
+    std::string path = dir + "/" + familyName + "_clades.csv";
+    std::ofstream os(path);
+    os << "cid,is_leaf,leaves,split_left,split_right,split_freq" << std::endl;
+
+    // Build leaf sets recursively using CladeSplits
+    std::vector<std::string> cidLeafSets(nClades);
+    for (CID cid = 0; cid < nClades; ++cid) {
+      if (this->_ccp.isLeaf(cid)) {
+        cidLeafSets[cid] = this->_ccp.getLeafLabel(cid);
+      } else {
+        // Use the first split to reconstruct the leaf set
+        const auto &splits = this->_ccp.getCladeSplits(cid);
+        if (!splits.empty()) {
+          // Leaf set = union of left and right child leaf sets
+          std::string left = cidLeafSets[splits[0].left];
+          std::string right = cidLeafSets[splits[0].right];
+          if (left.empty()) {
+            cidLeafSets[cid] = right;
+          } else if (right.empty()) {
+            cidLeafSets[cid] = left;
+          } else {
+            cidLeafSets[cid] = left + ";" + right;
+          }
+        }
+      }
+    }
+
+    for (CID cid = 0; cid < nClades; ++cid) {
+      bool isLeaf = this->_ccp.isLeaf(cid);
+      os << cid << ","
+         << (isLeaf ? "true" : "false") << ","
+         << cidLeafSets[cid];
+      if (!isLeaf) {
+        const auto &splits = this->_ccp.getCladeSplits(cid);
+        // Write all splits (there may be multiple for ambiguous rootings)
+        for (size_t s = 0; s < splits.size(); ++s) {
+          if (s == 0) {
+            os << "," << splits[s].left
+               << "," << splits[s].right
+               << "," << splits[s].frequency;
+          }
+          // Additional splits on separate rows
+          if (s > 0) {
+            os << std::endl;
+            os << cid << ","
+               << "false" << ","
+               << cidLeafSets[cid] << ","
+               << splits[s].left << ","
+               << splits[s].right << ","
+               << splits[s].frequency;
+          }
+        }
+      } else {
+        os << ",,,";
+      }
+      os << std::endl;
+    }
+    os.close();
+    Logger::info << "  Dumped clade info (" << nClades << " clades) to "
+                 << path << std::endl;
+  }
 }

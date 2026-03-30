@@ -75,6 +75,29 @@ public:
   void reconcile(unsigned int samples);
 
   /**
+   *  Score an external RecPhyloXML reconciliation scenario.
+   *  For each local family, writes the log probability to
+   *  reconciliations/all/<familyname>_xmlScenarioLogProb.txt.
+   *  CLVs must already be up to date (call after reconcile() or
+   *  call computeLikelihood() first).
+   */
+  void scoreScenarioXML(const std::string &xmlPath);
+
+  /**
+   *  Score all RecPhyloXML scenarios in a directory.
+   *  Writes a CSV file reconciliations/all/<family>_xmlDirScenarioLogProbs.csv
+   *  with one line per XML file: xml_filename<TAB>log_prob.
+   *  CLVs must already be up to date.
+   */
+  void scoreScenarioXMLDir(const std::string &dirPath);
+
+  /**
+   *  Set directory for dumping CLV data (Pi, E, event probabilities).
+   *  Must be called before reconcile().
+   */
+  void setDumpClvsDir(const std::string &dir);
+
+  /**
    *  Functions to handle transfer highways
    */
   void inferHighways(const std::string &highwayCandidateFile,

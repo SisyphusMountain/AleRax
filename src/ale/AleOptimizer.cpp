@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <dirent.h>
 
 #include <IO/FileSystem.hpp>
 #include <IO/Logger.hpp>
 #include <IO/ParallelOfstream.hpp>
+#include <IO/RecPhyloXMLParser.hpp>
+
+#include "MultiModel.hpp"
 #include <maths/Random.hpp>
 #include <parallelization/ParallelContext.hpp>
 #include <search/DatedSpeciesTreeSearch.hpp>
@@ -401,6 +405,13 @@ void AleOptimizer::saveFamiliesTakingHighway(
   ParallelContext::barrier();
 }
 
+void AleOptimizer::setDumpClvsDir(const std::string &dir) {
+  for (unsigned int i = 0; i < _evaluator->getLocalFamilyNumber(); ++i) {
+    auto &family = _geneTrees.getTrees()[i];
+    _evaluator->getEvaluation(i).setDumpClvsDir(dir, family.name);
+  }
+}
+
 void AleOptimizer::reconcile(unsigned int samples) {
   assert(getCurrentStep() == AleStep::Reconciliation);
   if (samples == 0) {
@@ -489,6 +500,13 @@ void AleOptimizer::reconcile(unsigned int samples) {
     }
     geneTreesOs.close();
     geneTreesAleOs.close();
+    auto logProbsFile = FileSystem::joinPaths(
+        allRecDir, localFamilies[i].name + "_sampleLogProbs.txt");
+    ParallelOfstream logProbsOs(logProbsFile, false);
+    for (unsigned int sample = 0; sample < samples; ++sample) {
+      logProbsOs << sample << "\t" << scenarios[sample]->getLogProba() << "\n";
+    }
+    logProbsOs.close();
     // writing in the reconciliations/summaries/ dir
     auto consensusFile = FileSystem::joinPaths(
         summariesDir, localFamilies[i].name + "_consensus_50.newick");
@@ -546,6 +564,126 @@ void AleOptimizer::saveBestHighways(
   }
   os.close();
   ParallelContext::barrier();
+}
+
+void AleOptimizer::scoreScenarioXML(const std::string &xmlPath) {
+  // Build species-label-to-node_index map from the full species tree
+  std::unordered_map<std::string, unsigned int> speciesLabelToIdx;
+  for (auto node : getSpeciesTree().getTree().getNodes()) {
+    if (node->label) {
+      speciesLabelToIdx[node->label] = node->node_index;
+    }
+  }
+  // Parse the RecPhyloXML file once (same scenario for all families)
+  auto xmlRoot = parseRecPhyloXMLGeneTree(xmlPath);
+  // Output directories
+  auto recDir = FileSystem::joinPaths(_outputDir, "reconciliations");
+  auto allRecDir = FileSystem::joinPaths(recDir, "all");
+  FileSystem::mkdir(recDir, true);
+  FileSystem::mkdir(allRecDir, true);
+  ParallelContext::barrier();
+  const auto &localFamilies = _geneTrees.getTrees();
+  for (unsigned int i = 0; i < localFamilies.size(); ++i) {
+    // Ensure CLVs are up to date for this family
+    auto &evaluation = _evaluator->getEvaluation(i);
+    evaluation.computeLogLikelihood(); // no-op if already cached
+    // Build the scoring scenario from the parsed XML.
+    // Returns false when the XML is for a different family (leaf set mismatch).
+    ScoringScenario scoringScenario;
+    if (!evaluation.buildScoringScenario(xmlRoot, speciesLabelToIdx,
+                                         scoringScenario)) {
+      continue; // XML is not for this family
+    }
+    // Score with category 0 (warn if gammaCategories > 1)
+    if (_info.gammaCategories > 1) {
+      Logger::info << "Warning: scoreScenarioXML uses category 0 only "
+                      "(gammaCategories="
+                   << _info.gammaCategories << ")" << std::endl;
+    }
+    double logProb = evaluation.scoreGivenScenario(scoringScenario, 0);
+    // Write result
+    auto outFile = FileSystem::joinPaths(
+        allRecDir, localFamilies[i].name + "_xmlScenarioLogProb.txt");
+    ParallelOfstream os(outFile, false);
+    os << logProb << "\n";
+    os.close();
+  }
+  ParallelContext::barrier();
+  Logger::timed << "Scenario scoring output directory: " << allRecDir
+                << std::endl;
+}
+
+void AleOptimizer::scoreScenarioXMLDir(const std::string &dirPath) {
+  // Collect all .xml files in dirPath
+  std::vector<std::string> xmlPaths;
+  DIR *dir = opendir(dirPath.c_str());
+  if (!dir) {
+    Logger::error << "Error: cannot open directory for scoring: " << dirPath
+                  << std::endl;
+    return;
+  }
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != nullptr) {
+    std::string name(entry->d_name);
+    if (name.size() > 4 && name.substr(name.size() - 4) == ".xml") {
+      xmlPaths.push_back(FileSystem::joinPaths(dirPath, name));
+    }
+  }
+  closedir(dir);
+  std::sort(xmlPaths.begin(), xmlPaths.end());
+  if (xmlPaths.empty()) {
+    Logger::info << "No .xml files found in: " << dirPath << std::endl;
+    return;
+  }
+  Logger::timed << "Scoring " << xmlPaths.size()
+                << " XML files from directory: " << dirPath << std::endl;
+
+  // Build species-label-to-node_index map once
+  std::unordered_map<std::string, unsigned int> speciesLabelToIdx;
+  for (auto node : getSpeciesTree().getTree().getNodes()) {
+    if (node->label) {
+      speciesLabelToIdx[node->label] = node->node_index;
+    }
+  }
+  // Output directories
+  auto recDir = FileSystem::joinPaths(_outputDir, "reconciliations");
+  auto allRecDir = FileSystem::joinPaths(recDir, "all");
+  FileSystem::mkdir(recDir, true);
+  FileSystem::mkdir(allRecDir, true);
+  ParallelContext::barrier();
+
+  if (_info.gammaCategories > 1) {
+    Logger::info << "Warning: scoreScenarioXMLDir uses category 0 only "
+                    "(gammaCategories="
+                 << _info.gammaCategories << ")" << std::endl;
+  }
+  const auto &localFamilies = _geneTrees.getTrees();
+  for (unsigned int i = 0; i < localFamilies.size(); ++i) {
+    auto &evaluation = _evaluator->getEvaluation(i);
+    evaluation.computeLogLikelihood(); // no-op if already cached
+    auto csvPath =
+        FileSystem::joinPaths(allRecDir, localFamilies[i].name +
+                                             "_xmlDirScenarioLogProbs.csv");
+    ParallelOfstream csvOs(csvPath, false);
+    csvOs << "xml_file\tlog_prob\n";
+    for (const auto &xmlPath : xmlPaths) {
+      auto xmlRoot = parseRecPhyloXMLGeneTree(xmlPath);
+      ScoringScenario scoringScenario;
+      if (!evaluation.buildScoringScenario(xmlRoot, speciesLabelToIdx,
+                                           scoringScenario)) {
+        continue; // XML is not for this family
+      }
+      double logProb = evaluation.scoreGivenScenario(scoringScenario, 0);
+      // Write just the filename, not the full path
+      auto slash = xmlPath.rfind('/');
+      auto xmlName = (slash == std::string::npos) ? xmlPath
+                                                   : xmlPath.substr(slash + 1);
+      csvOs << xmlName << "\t" << logProb << "\n";
+    }
+    csvOs.close();
+  }
+  ParallelContext::barrier();
+  Logger::timed << "Directory scoring output: " << allRecDir << std::endl;
 }
 
 void AleOptimizer::inferHighways(const std::string &highwayCandidateFile,

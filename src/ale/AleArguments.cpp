@@ -32,7 +32,8 @@ AleArguments::AleArguments(int iargc, char **iargv)
       maxCladeSplitRatio(DEFAULT_MAX_SPLIT_RATIO),
       sampleFrequency(DEFAULT_SAMPLE_FREQUENCY), output("alerax_output"),
       geneTreeSamples(100), cleanupCCP(false), seed(123),
-      randomSpeciesRoot(false), optVerbose(false) {
+      randomSpeciesRoot(false), optVerbose(false), scenarioXMLToScore(""),
+      scenarioXMLDirToScore(""), dumpClvsDir("") {
   if (argc == 1) {
     printHelp();
     ParallelContext::abort(0);
@@ -129,6 +130,12 @@ AleArguments::AleArguments(int iargc, char **iargv)
       randomSpeciesRoot = true;
     } else if (arg == "--verbose-opt") {
       optVerbose = true;
+    } else if (arg == "--score-scenario-xml") {
+      scenarioXMLToScore = std::string(argv[++i]);
+    } else if (arg == "--score-scenario-xml-dir") {
+      scenarioXMLDirToScore = std::string(argv[++i]);
+    } else if (arg == "--dump-clvs") {
+      dumpClvsDir = std::string(argv[++i]);
       /* start recently renamed options */
     } else if (arg == "--per-family-rates") {
       printDeprecated(arg, "--model-parametrization PER-FAMILY");
@@ -412,6 +419,10 @@ void AleArguments::printHelp() const {
   Logger::info << "\t--highway-candidates-file <filepath>" << std::endl;
   Logger::info << "\t--highway-candidates-step1 <int>" << std::endl;
   Logger::info << "\t--highway-candidates-step2 <int>" << std::endl;
+
+  Logger::info << "Scoring options:" << std::endl;
+  Logger::info << "\t--score-scenario-xml <filepath>" << std::endl;
+  Logger::info << "\t--score-scenario-xml-dir <dirpath>" << std::endl;
 
   Logger::info << "For a more detailed description please check the wiki on "
                << "our github page:" << std::endl;

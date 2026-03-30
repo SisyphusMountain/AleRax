@@ -104,4 +104,11 @@ public:
   // experimental
   bool randomSpeciesRoot;
   bool optVerbose;
+
+  // scoring
+  std::string scenarioXMLToScore;    // path to RecPhyloXML scenario to score
+  std::string scenarioXMLDirToScore; // directory of RecPhyloXML scenarios to score
+
+  // CLV export
+  std::string dumpClvsDir;           // if non-empty, dump CLVs (Pi, E, etc.) to this directory
 };
