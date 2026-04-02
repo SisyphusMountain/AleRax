@@ -36,3 +36,6 @@ build/
 
 # Test outputs
 tests/outputs/
+
+# Generated log with local paths
+data/test_data/*/families_script_logs.txt

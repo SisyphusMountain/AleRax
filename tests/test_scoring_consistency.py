@@ -99,7 +99,8 @@ def score_xml(xml_path, score_out_dir):
         rec_dir(score_out_dir),
         f"{FAMILY_NAME}_xmlScenarioLogProb.txt",
     )
-    return float(open(result_file).read().strip())
+    with open(result_file) as f:
+        return float(f.read().strip())
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +108,10 @@ def score_xml(xml_path, score_out_dir):
 # ---------------------------------------------------------------------------
 
 def main():
+    if not os.path.exists(FAMILIES):
+        sys.exit(f"FAMILIES file not found: {FAMILIES}\n"
+                 f"Run run_alerax_tests.py first to generate it.")
+
     # ------------------------------------------------------------------
     # Step 1: sample N reconciliation trajectories
     # ------------------------------------------------------------------
@@ -138,7 +143,8 @@ def main():
     for idx in sorted(sample_logprobs):
         xml = os.path.join(rdir, f"{FAMILY_NAME}_sample_{idx}.xml")
         if os.path.exists(xml):
-            xml_content[idx] = open(xml).read()
+            with open(xml) as f:
+                xml_content[idx] = f.read()
 
     vis_groups = defaultdict(list)  # content -> [sample indices]
     for idx, c in xml_content.items():
@@ -246,7 +252,6 @@ identical logP.  Expected = k_v * N * exp(logP_v).
     # Show top 15 trajectory-logP groups
     print(f"{'logP':>12}  {'obs':>6}  {'k':>3}  {'expected':>9}  {'obs/exp':>8}")
     print("-" * 46)
-    sampled_prob_mass = sum(math.exp(lp) for lp in lp_counts)
     for lp_v, obs_v, k_v, exp_v in rows[:15]:
         print(f"{lp_v:>12.6f}  {obs_v:>6}  {k_v:>3}  {exp_v:>9.2f}  "
               f"{obs_v/exp_v:>8.4f}")
